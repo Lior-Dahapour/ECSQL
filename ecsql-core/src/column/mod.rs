@@ -4,7 +4,7 @@ use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc};
 use core::alloc::Layout;
 use core::cmp::max;
 use core::num::NonZeroUsize;
-use core::ptr::NonNull;
+use core::ptr::{slice_from_raw_parts, NonNull};
 
 /// Storage for every row of one component inside one table.
 pub struct Column {
@@ -56,6 +56,40 @@ impl Column {
         self.capacity
     }
 
+    /// Appends one row, copied from `row`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with "row size mismatch" if `row.len()` is not the row size.
+    pub fn push(&mut self, row: &[u8]) {
+        assert_eq!(row.len(), self.item_layout.size(), "row size mismatch");
+        self.reserve(1);
+        // SAFETY: `reserve` made `len < capacity`, so row `len` is in bounds; `row` is a separate
+        // borrow, so it cannot overlap the column's buffer.
+        unsafe { core::ptr::copy_nonoverlapping(row.as_ptr(), self.row_ptr(self.len), row.len()) };
+        self.len += 1;
+    }
+
+    /// Returns the bytes of row `index`, or `None` if it is out of bounds.
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.len {
+            return None;
+        }
+        // SAFETY: `index < len <= capacity`, so the row is in bounds and initialized.
+        Some(unsafe { core::slice::from_raw_parts(self.row_ptr(index), self.item_layout.size()) })
+
+    }
+
+    /// Returns the bytes of row `index` for writing, or `None` if it is out of bounds.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut [u8]> {
+        if index >= self.len {
+            return None;
+        }
+        // SAFETY: `index < len <= capacity`, so the row is in bounds and initialized.
+        // and &mut self makes this the only reference into the column.
+        Some(unsafe { core::slice::from_raw_parts_mut(self.row_ptr(index), self.item_layout.size()) })
+    }
+
     /// Ensures room for at least `additional` more rows beyond `len`.
     ///
     /// # Arguments
@@ -99,6 +133,19 @@ impl Column {
                 self.ptr = NonNull::new_unchecked(ptr);
                 self.capacity = new_capacity
             }
+        }
+    }
+
+    /// Returns a pointer to the first byte of row `index`.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be `<= self.capacity`, so the pointer stays inside the buffer or one past it.
+    unsafe fn row_ptr(&self, index: usize) -> *mut u8 {
+        // SAFETY: the caller guarantees `index <= capacity`, so the offset stays within the buffer
+        // or one past it, and `index * size` cannot overflow since `buffer_layout` checked it.
+        unsafe {
+            self.ptr.as_ptr().add(index * self.item_layout.size())
         }
     }
 
@@ -293,5 +340,113 @@ mod tests {
 
         // 16 bytes per row times usize::MAX / 8 rows overflows usize.
         column.reserve(usize::MAX / 8);
+    }
+
+    /// A 16-byte, 8-aligned row whose every byte is `seed + offset`, so rows are distinct.
+    fn sample_row(seed: u8) -> [u8; 16] {
+        core::array::from_fn(|offset| seed.wrapping_add(offset as u8))
+    }
+
+    fn sixteen_byte_column() -> Column {
+        Column::new(Layout::from_size_align(16, 8).expect("valid layout"))
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn push_then_get_round_trips_bytes() {
+        let mut column = sixteen_byte_column();
+        let rows = [sample_row(0), sample_row(100), sample_row(200)];
+
+        for row in &rows {
+            column.push(row);
+        }
+
+        assert_eq!(column.len(), 3);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(column.get(index), Some(&row[..]), "row {index}");
+        }
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn get_out_of_bounds_is_none() {
+        let mut column = sixteen_byte_column();
+        column.push(&sample_row(0));
+        column.reserve(10);
+
+        // Index 1 is inside the allocation but not an initialized row.
+        assert_eq!(column.get(1), None);
+        assert_eq!(column.get(usize::MAX), None);
+        assert_eq!(column.get_mut(1), None);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn push_grows_and_keeps_every_row() {
+        let mut column = sixteen_byte_column();
+
+        for seed in 0..100 {
+            column.push(&sample_row(seed));
+        }
+
+        assert_eq!(column.len(), 100);
+        for seed in 0..100 {
+            assert_eq!(column.get(usize::from(seed)), Some(&sample_row(seed)[..]));
+        }
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn rows_are_aligned_and_one_stride_apart() {
+        let mut column = sixteen_byte_column();
+        column.push(&sample_row(0));
+        column.push(&sample_row(1));
+
+        let first = column.get(0).expect("row 0").as_ptr().addr();
+        let second = column.get(1).expect("row 1").as_ptr().addr();
+
+        assert_eq!(first % 8, 0);
+        assert_eq!(second - first, 16);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn get_mut_writes_through_to_the_row() {
+        let mut column = sixteen_byte_column();
+        column.push(&sample_row(0));
+        column.push(&sample_row(1));
+
+        column
+            .get_mut(1)
+            .expect("row 1")
+            .copy_from_slice(&sample_row(50));
+
+        assert_eq!(column.get(0), Some(&sample_row(0)[..]));
+        assert_eq!(column.get(1), Some(&sample_row(50)[..]));
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    #[should_panic(expected = "row size mismatch")]
+    fn push_rejects_wrong_row_size() {
+        let mut column = sixteen_byte_column();
+
+        column.push(&[0; 8]);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn tag_column_push_counts_rows_without_allocating() {
+        let mut column = Column::new(Layout::from_size_align(0, 1).expect("valid layout"));
+        let ptr_before = column.ptr;
+
+        for _ in 0..1000 {
+            column.push(&[]);
+        }
+
+        assert_eq!(column.len(), 1000);
+        assert_eq!(column.get(999), Some(&[][..]));
+        assert_eq!(column.get(1000), None);
+        assert_eq!(column.ptr, ptr_before);
     }
 }
