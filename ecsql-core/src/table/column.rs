@@ -1,10 +1,10 @@
-//! Type-erased columns: one contiguous, aligned block of rows for a single component.
+//! Type-erased column: one contiguous, aligned block of rows for a single component.
 
 use alloc::alloc::{alloc, dealloc, handle_alloc_error, realloc};
 use core::alloc::Layout;
 use core::cmp::max;
 use core::num::NonZeroUsize;
-use core::ptr::{slice_from_raw_parts, NonNull};
+use core::ptr::NonNull;
 
 /// Storage for every row of one component inside one table.
 pub struct Column {
@@ -56,6 +56,11 @@ impl Column {
         self.capacity
     }
 
+    /// Returns the size and alignment of one row.
+    pub fn item_layout(&self) -> Layout {
+        self.item_layout
+    }
+
     /// Appends one row, copied from `row`.
     ///
     /// # Panics
@@ -77,7 +82,6 @@ impl Column {
         }
         // SAFETY: `index < len <= capacity`, so the row is in bounds and initialized.
         Some(unsafe { core::slice::from_raw_parts(self.row_ptr(index), self.item_layout.size()) })
-
     }
 
     /// Returns the bytes of row `index` for writing, or `None` if it is out of bounds.
@@ -87,7 +91,44 @@ impl Column {
         }
         // SAFETY: `index < len <= capacity`, so the row is in bounds and initialized.
         // and &mut self makes this the only reference into the column.
-        Some(unsafe { core::slice::from_raw_parts_mut(self.row_ptr(index), self.item_layout.size()) })
+        Some(unsafe {
+            core::slice::from_raw_parts_mut(self.row_ptr(index), self.item_layout.size())
+        })
+    }
+
+    /// Removes row `index` in O(1) by moving the last row into its place.
+    ///
+    /// # Panics
+    ///
+    /// Panics with "swap_remove index out of bounds" if `index >= len`.
+    pub fn swap_remove(&mut self, index: usize) {
+        assert!(index < self.len, "swap_remove index out of bounds");
+        let last = self.len() - 1;
+        if index != last {
+            // SAFETY: `index < last < len`, so both rows are in bounds and initialized, and they are
+            // distinct, so they don't overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.row_ptr(last),
+                    self.row_ptr(index),
+                    self.item_layout.size(),
+                );
+            }
+        }
+        self.len -= 1;
+    }
+
+    /// Moves row `index` to the end of `dst`, then swap-removes it from this column.
+    ///
+    /// # Panics
+    ///
+    /// Panics with "column layouts differ" if `dst` stores a different row layout, and with
+    /// "move_row_to index out of bounds" if `index >= len`.
+    pub fn move_row_to(&mut self, index: usize, dst: &mut Column) {
+        assert_eq!(self.item_layout, dst.item_layout, "column layouts differ");
+        let row = self.get(index).expect("move_row_to index out of bounds");
+        dst.push(row);
+        self.swap_remove(index);
     }
 
     /// Ensures room for at least `additional` more rows beyond `len`.
@@ -144,9 +185,7 @@ impl Column {
     unsafe fn row_ptr(&self, index: usize) -> *mut u8 {
         // SAFETY: the caller guarantees `index <= capacity`, so the offset stays within the buffer
         // or one past it, and `index * size` cannot overflow since `buffer_layout` checked it.
-        unsafe {
-            self.ptr.as_ptr().add(index * self.item_layout.size())
-        }
+        unsafe { self.ptr.as_ptr().add(index * self.item_layout.size()) }
     }
 
     /// Returns the layout of a buffer holding `capacity` rows.
@@ -448,5 +487,178 @@ mod tests {
         assert_eq!(column.get(999), Some(&[][..]));
         assert_eq!(column.get(1000), None);
         assert_eq!(column.ptr, ptr_before);
+    }
+
+    /// A 16-byte column holding one `sample_row` per seed, in order.
+    fn column_with_rows(seeds: &[u8]) -> Column {
+        let mut column = sixteen_byte_column();
+        for &seed in seeds {
+            column.push(&sample_row(seed));
+        }
+        column
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn swap_remove_moves_last_row_into_the_hole() {
+        let mut column = column_with_rows(&[0, 10, 20, 30]);
+
+        column.swap_remove(1);
+
+        assert_eq!(column.len(), 3);
+        assert_eq!(column.get(0), Some(&sample_row(0)[..]));
+        assert_eq!(column.get(1), Some(&sample_row(30)[..]));
+        assert_eq!(column.get(2), Some(&sample_row(20)[..]));
+        assert_eq!(column.get(3), None);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn swap_remove_last_row_only_shrinks() {
+        let mut column = column_with_rows(&[0, 10, 20]);
+
+        column.swap_remove(2);
+
+        assert_eq!(column.len(), 2);
+        assert_eq!(column.get(0), Some(&sample_row(0)[..]));
+        assert_eq!(column.get(1), Some(&sample_row(10)[..]));
+        assert_eq!(column.get(2), None);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn swap_remove_keeps_memory_for_reuse() {
+        let mut column = column_with_rows(&[0]);
+        let ptr_before = column.ptr;
+        let capacity_before = column.capacity();
+
+        column.swap_remove(0);
+        column.push(&sample_row(99));
+
+        assert_eq!(column.len(), 1);
+        assert_eq!(column.get(0), Some(&sample_row(99)[..]));
+        assert_eq!(column.ptr, ptr_before);
+        assert_eq!(column.capacity(), capacity_before);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn swap_remove_every_row_from_the_front_empties_the_column() {
+        let mut column = column_with_rows(&[0, 10, 20, 30, 40]);
+
+        // Each removal at 0 pulls the current last row to the front.
+        let expected_front = [40, 30, 20, 10];
+        for seed in expected_front {
+            column.swap_remove(0);
+            assert_eq!(column.get(0), Some(&sample_row(seed)[..]));
+        }
+        column.swap_remove(0);
+
+        assert!(column.is_empty());
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    #[should_panic(expected = "swap_remove index out of bounds")]
+    fn swap_remove_panics_out_of_bounds() {
+        let mut column = column_with_rows(&[0, 10]);
+
+        column.swap_remove(2);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn swap_remove_on_tag_column_only_counts() {
+        let mut column = Column::new(Layout::from_size_align(0, 1).expect("valid layout"));
+        for _ in 0..5 {
+            column.push(&[]);
+        }
+
+        column.swap_remove(2);
+
+        assert_eq!(column.len(), 4);
+        assert_eq!(column.get(3), Some(&[][..]));
+        assert_eq!(column.get(4), None);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn move_row_to_appends_to_destination_and_swap_removes_source() {
+        let mut src = column_with_rows(&[0, 10, 20]);
+        let mut dst = column_with_rows(&[99]);
+
+        src.move_row_to(0, &mut dst);
+
+        assert_eq!(dst.len(), 2);
+        assert_eq!(dst.get(0), Some(&sample_row(99)[..]));
+        assert_eq!(dst.get(1), Some(&sample_row(0)[..]));
+        assert_eq!(src.len(), 2);
+        assert_eq!(src.get(0), Some(&sample_row(20)[..]));
+        assert_eq!(src.get(1), Some(&sample_row(10)[..]));
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn move_row_to_last_row_leaves_other_rows_in_place() {
+        let mut src = column_with_rows(&[0, 10]);
+        let mut dst = column_with_rows(&[]);
+
+        src.move_row_to(1, &mut dst);
+
+        assert_eq!(dst.get(0), Some(&sample_row(10)[..]));
+        assert_eq!(src.len(), 1);
+        assert_eq!(src.get(0), Some(&sample_row(0)[..]));
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn move_row_to_grows_destination() {
+        let seeds: [u8; 50] = core::array::from_fn(|i| i as u8);
+        let mut src = column_with_rows(&seeds);
+        let mut dst = column_with_rows(&[]);
+
+        while !src.is_empty() {
+            src.move_row_to(0, &mut dst);
+        }
+
+        assert_eq!(dst.len(), 50);
+        assert!(dst.capacity() >= 50);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    #[should_panic(expected = "move_row_to index out of bounds")]
+    fn move_row_to_panics_out_of_bounds() {
+        let mut src = column_with_rows(&[0]);
+        let mut dst = column_with_rows(&[]);
+
+        src.move_row_to(1, &mut dst);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    #[should_panic(expected = "column layouts differ")]
+    fn move_row_to_panics_on_layout_mismatch() {
+        let mut src = column_with_rows(&[0]);
+        // Same size, different alignment: a different component, so moving is a bug.
+        let mut dst = Column::new(Layout::from_size_align(16, 4).expect("valid layout"));
+
+        src.move_row_to(0, &mut dst);
+    }
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn move_row_to_between_tag_columns_only_counts() {
+        let tag = Layout::from_size_align(0, 1).expect("valid layout");
+        let mut src = Column::new(tag);
+        let mut dst = Column::new(tag);
+        for _ in 0..3 {
+            src.push(&[]);
+        }
+
+        src.move_row_to(1, &mut dst);
+
+        assert_eq!(src.len(), 2);
+        assert_eq!(dst.len(), 1);
     }
 }

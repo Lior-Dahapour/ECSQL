@@ -7,9 +7,9 @@
 
 extern crate alloc;
 
-pub mod column;
 pub mod component;
 pub mod entity;
+pub mod table;
 
 pub use component::{
     ComponentError, ComponentId, ComponentInfo, Components, Field, FieldType, StorageKind,
