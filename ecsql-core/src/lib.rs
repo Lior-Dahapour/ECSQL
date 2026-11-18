@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod column;
 pub mod component;
 pub mod entity;
 
