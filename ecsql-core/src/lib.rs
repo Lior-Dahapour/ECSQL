@@ -9,6 +9,8 @@ extern crate alloc;
 
 pub mod component;
 pub mod entity;
+pub mod page;
+pub mod sparse;
 pub mod table;
 
 pub use component::{
