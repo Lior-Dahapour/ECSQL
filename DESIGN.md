@@ -48,7 +48,7 @@ ECSQL is the database a game server saves to and loads from, not the live game w
 | **Archetype** | The unique *set* of (non-sparse) component types an entity has. Order does not matter. |
 | **Table** | Storage for all entities of one archetype: PAX pages, each holding whole rows with every component's column contiguous inside the page, plus an entity-ID column. |
 | **Row** | The position within a table. The same row index across all columns is the same entity. |
-| **Sparse component** | Opt-in (`SPARSE`) for components that toggle often: stored outside archetype tables, by entity index, with a presence bit. Toggling it never moves the entity. |
+| **Sparse component** | Opt-in (`SPARSE`) for components that toggle often or that few entities have: stored outside archetype tables, in a B-tree keyed by entity index. Adding or removing it never moves the entity. |
 
 ### Component schemas
 A component is a record of typed fields. A **tag** is a component with zero fields.
@@ -83,7 +83,7 @@ Things an entity owns are their own entities, linked by an `entity` field, not n
 - **[DECIDED]** An `Entity` behaves as a packed `u64`: `generation << 32 | index`. `generation` is a `NonZeroU32` (starts at 1), so `Option<Entity>` is still 8 bytes.
 - `index` points into the **entity metadata array**. Each slot stores `{ generation, archetype_id, row }`, or a free-list link when unused. Looking up an entity is an array index plus a generation compare: no hashing.
 - `generation` increments when a slot is freed, so stale IDs are detected rather than silently matching a reused slot.
-- **[OPEN]** Which free index to reuse. Lowest-first keeps sparse stores dense.
+- **[OPEN]** Which free index to reuse. Lowest-first keeps the entity metadata pages dense.
 - IDs can be allocated in blocks, with no storage touched, so a client can reserve IDs before knowing what the entity will be.
 - Everything that refers to an entity (indexes, WAL records, relations) stores the `Entity`, never a physical `(table, row)`. Rows move on `swap_remove` and archetype moves; only the metadata slot changes.
 
@@ -91,7 +91,7 @@ Things an entity owns are their own entities, linked by an `entity` field, not n
 
 ## 3. Storage architecture
 
-### 3.1 Core data structures **[DECIDED: archetype tables in PAX pages, plus sparse stores]**
+### 3.1 Core data structures **[DECIDED: archetype tables in PAX pages, plus sparse B-trees]**
 
 ```
 World
@@ -99,7 +99,7 @@ World
  ├─ entities:    EntityMeta[]                    // index -> { generation, archetype, row }
  ├─ archetypes:  Vec<Archetype>
  ├─ arch_index:  HashMap<SortedComponentSet, ArchetypeId>
- └─ sparse:      Vec<SparseStore>                // one per SPARSE component
+ └─ sparse:      one B-tree per SPARSE component
 
 Archetype
  ├─ id, component_set (sorted, table components only)
@@ -111,10 +111,9 @@ Table (one per archetype)                        // a list of PAX pages
            [header | entity IDs × N | component A × N | component B × N | ...]
            row r lives in page r / N, slot r % N
 
-SparseStore (opt-in per component: CREATE COMPONENT ... SPARSE)
- ├─ presence: 1 bit per entity index, in small presence pages (8 KiB covers 65,536 entities)
- └─ data:     paged array addressed by entity index (page e.index >> k, slot e.index & mask),
-              or a B-tree keyed by entity index for very rare components
+Sparse component (opt-in per component: CREATE COMPONENT ... SPARSE)
+ └─ B-tree keyed by entity index: leaf pages hold sorted (entity, value) entries,
+    internal pages hold separator keys; a tag stores keys only
 ```
 
 **Why archetype tables (PAX pages) by default.** ECSQL's main work is loading and saving whole entities. A PAX page (Ailamaki et al., "Weaving relations for cache performance", VLDB 2001; reference [6] in `ref/books/column-stores-vs-row-stores.pdf`) keeps whole rows of one archetype in a page, but stores each component's column contiguously inside the page. Unity's ECS stores archetypes the same way, in 16 KiB chunks. So:
@@ -135,13 +134,21 @@ Costs per operation for a 30-component entity:
 
 Bevy made the same choice: `StorageType::Table` is the default ("fast and cache-friendly iteration, but slower addition and removal of components") and `StorageType::SparseSet` is opt-in ("fast addition and removal of components, but slower iteration"), `ref/src/bevy/crates/bevy_ecs/src/component/mod.rs`.
 
-**SPARSE components.** Components that are toggled often (`Banned`, `Online`, short-lived states) are declared `SPARSE`. They are not part of the archetype's table, so adding or removing them never moves the entity: it sets or clears a presence bit. Archetypes that differ only by sparse components share one table. Sparse tags have no data pages at all, so they are also the cheapest filters (section 3.2).
+**SPARSE components [DECIDED 2026-11-20].** Components that are toggled often (`Banned`, `Online`, short-lived states) or that few entities have (`Admin`) are declared `SPARSE`. They are not part of the archetype's table, so adding or removing them never moves the entity: it inserts or deletes one entry in that component's B-tree, keyed by entity index, which touches one leaf page. Archetypes that differ only by sparse components share one table.
+
+Why a B-tree, compared against the references:
+- SQLite stores every table as a B-tree keyed by a 64-bit integer (`intkey` pages, `ref/src/sqlite/src/btreeInt.h`; lookup `sqlite3BtreeTableMoveto`, `btree.c`): "Finding a particular key requires reading O(log(M)) pages". PostgreSQL keeps rows in heap pages with a separate B-tree (`src/backend/access/nbtree/`). "All major commercial systems implement heaps and B+-tree indexes" (`ref/books/architecture-of-a-database-system.pdf`, section 4).
+- Space matches the number of entities that have the component: 5 admins among 1M players is one leaf page. Nothing moves on add or remove, and entries are found by `Entity`, never by a physical position.
+- Rejected: a presence bitmap plus slots addressed by entity index. It costs one bit (and value slots) per entity index even for a rare component, and "bitmaps are expensive to update, so their utility is restricted to warehouse environments" (same book, section 4.6). Rejected: Bevy's sparse set (`bevy_ecs/src/storage/sparse_set.rs`), an in-memory structure whose dense array moves values on removal.
+- The same B-tree, keyed by an integer and storing `Entity`, serves the user-declared indexes.
+- Cost: checking a sparse component is a search in one or two cached pages instead of a bit test.
+- **[PLANNED]** The B-tree page format, compared against SQLite's `btreeInt.h` and PostgreSQL's `nbtree`. Values are fixed-size, so leaves can use sorted key and value minipages instead of variable-length cells.
 
 **[OPEN] Rows that do not fit a page.** A PAX page needs at least one whole row. Options: a maximum row size per archetype, with large components forced to `SPARSE` or to an overflow store; or splitting very wide archetypes into column groups across pages. Decide with the page format.
 
 **[OPEN] Archetype explosion.** Many rare component combinations create many small tables, each with a partly filled last page. `SPARSE` for rare or optional components is the main defence, as in Bevy and Flecs.
 
-**Table (built in `ecsql-core/src/table`, in memory so far):**
+**Table (built in `ecsql-core/src/table`, in memory so far; its heap-buffer `Column`s are replaced by PAX pages in the buffer pool, section 3.3, and the logic below moves to page operations):**
 - Sorted parallel arrays instead of a `HashMap<ComponentId, Column>`. An archetype rarely has more than about 20 components, so a binary search is as fast as hashing, queries resolve column indices once per table anyway, and sorted IDs let a move between tables be a merge walk with no lookups. (Bevy uses a sparse set here; its sparse array is as long as the largest `ComponentId`, per table, which does not fit thousands of runtime-defined components.)
 - Invariant: every column has exactly `entities.len()` rows.
 - Operations: `push(entity, rows)`, `reserve(n)`, `swap_remove(row) -> Option<Entity>` (returns the entity moved into `row`, whose metadata the World must update), and `move_row_to(row, dst, added) -> (dst_row, moved)`.
@@ -168,12 +175,12 @@ Execution:
 for archetype in matching_archetypes:           // table components decide the archetypes
     for page in archetype.table.pages:
         for slot in 0..page.row_count:
-            if a sparse `with`/`without` is present: check its presence bit for this entity
+            if a sparse `with`/`without` is present: look this entity up in its B-tree
             read the slot from each requested column inside the page
 ```
 `WITHOUT` on a table component excludes whole archetypes with no per-row check. Filters (`WHERE Health.current < 10`) apply per row on the column data. Aggregates (`AVG(Health.current)`) scan one column per page. Both should be vectorized over the page's column slices.
 
-**Tags as filters [DECIDED].** Tags (components with no fields, like `Warrior` or `Banned`) cost almost nothing to filter by. A table tag (a class marker like `Warrior`, set at spawn and rarely changed) is part of the archetype, so it selects archetypes and no row is checked. A sparse tag (a status like `Banned`) is one presence bit per entity: 1M entities fit in 16 presence pages, which stay in the buffer pool. `SELECT (Player, Inventory, Warrior) WITHOUT Banned` picks the archetypes containing `Player`, `Inventory` and `Warrior`, then skips rows whose `Banned` bit is set.
+**Tags as filters [DECIDED].** Tags (components with no fields, like `Warrior` or `Banned`) cost almost nothing to filter by. A table tag (a class marker like `Warrior`, set at spawn and rarely changed) is part of the archetype, so it selects archetypes and no row is checked. A sparse tag (a status like `Banned`) is a B-tree of entity keys only; a rare one is a single page that stays in the buffer pool. `SELECT (Player, Inventory, Warrior) WITHOUT Banned` picks the archetypes containing `Player`, `Inventory` and `Warrior`, then skips rows whose entity is in the `Banned` tree.
 
 **[PLANNED]** Per-archetype row counts and per-sparse-store counts, so the planner can order filters from the most selective.
 
@@ -187,13 +194,30 @@ for archetype in matching_archetypes:           // table components decide the a
 | SQLite | one file, everything is a B-tree keyed by rowid; pages via `sqlite3PagerGet` and a page cache | page model fits; we don't need a tree for entity lookups |
 | ScyllaDB | LSM: in-memory memtable, flushed to immutable SSTables, merged by compaction; a row cache instead of a page cache; Seastar bypasses the OS page cache | its strength is sustained write throughput, which is not our workload; reads would have to check several files |
 | Bevy | memory only; archetype tables by default, sparse sets opt-in | the same split we use, in memory |
-| DuckDB | columnar: row groups of 122,880 rows, column segments in 256 KiB blocks, validity bitmaps for missing values, MVCC through version info beside the data (`src/storage/table/`) | validity bitmaps fit our sparse presence bits; its column-per-segment layout and large blocks suit analytics, not one-page entity loads |
+| DuckDB | columnar: row groups of 122,880 rows, column segments in 256 KiB blocks, validity bitmaps for missing values, MVCC through version info beside the data (`src/storage/table/`) | validity bitmaps suit read-mostly columns, not per-entity toggles; its column-per-segment layout and large blocks suit analytics, not one-page entity loads |
 
 **[DECIDED] Update in place.** A changed component overwrites its slot in the page where it already is; the page is written back at checkpoint. (PostgreSQL writes a new tuple version instead; ScyllaDB never touches existing files and merges later by compaction.) Fallback if random page writes at checkpoint ever become the bottleneck: keep changes in memory and rewrite pages in batches at checkpoint, as DuckDB does with `UpdateSegment` (`src/storage/table/`).
 
 Why pages: an entity is `metadata[index] -> (archetype, row) -> page row / N`, one page read with no tree walk. Fixed-size rows need no line pointers and are updated in place. PAX keeps each component's column contiguous inside the page. The WAL gives sequential writes, which is most of what an LSM would buy us. From ScyllaDB we take our own I/O and buffer pool that bypass the OS page cache, and later one thread per core.
 
-What carries over from the in-memory code: `Entity`, the allocator, the component registry, `RowLayout` (the slot format of one component inside a page), and the Table logic. Split: `ecsql-core` (`no_std`) defines the page formats and table logic over `&mut [u8]` pages; `ecsql-storage` does files, the buffer pool and the WAL.
+**[DECIDED 2026-11-20] Engine model: PostgreSQL.** Stored data lives only in pages. In memory, the buffer pool is an array of 8 KiB frames holding the disk pages themselves, plus one descriptor per frame (PostgreSQL: `NBuffers * BLCKSZ` "Buffer Blocks" and `BufferDescriptors`, `src/backend/storage/buffer/buf_init.c`). A change is made inside the page in its frame, the frame is marked dirty (`MarkBufferDirty`), and it is written back as is after the WAL is durable up to its LSN (`FlushBuffer`: `XLogFlush`, checksum, `smgrwrite`, `bufmgr.c`). There is no separate in-memory layout for stored data: heap buffers (`Vec`, `Column`) cannot be flushed per page, partly cached, addressed by WAL records or checked per page.
+
+Compared with ScyllaDB, whose memtable and row cache are trees (`replica/memtable.hh`, `mutation/mutation_partition.hh`) in a relocating log-structured allocator (`utils/logalloc.hh`), serialized into new SSTables at flush (`table::seal_active_memtable`, `replica/table.cc`). That allocator only works inside the whole LSM engine (commitlog, memtable, SSTables, compaction, row cache). On five example queries with archetypes kept in both engines:
+
+| query | PostgreSQL model | ScyllaDB model |
+|---|---|---|
+| SELECT a whole player by an indexed name | ~3 cached pages; the entity is one PAX page | equal on a cache hit; a miss merges across SSTables |
+| SPAWN | append to the archetype's last page + metadata | memtable insert |
+| ADD / REMOVE a table component | move one row, about 5 pages dirtied in memory; 1 leaf page if `SPARSE` | tombstone + new row, nothing moves |
+| UPDATE a component | overwrite in place; many saves, one page write per checkpoint | new version each time, rewritten by compaction |
+
+Pages win loading and saving a player, the MMO's most common operations; the LSM wins archetype moves, which `SPARSE` covers. Commit cost is one WAL append in both.
+
+**[DECIDED 2026-11-20] Torn pages: overwrite in place with full-page images, as PostgreSQL.** A checkpoint writes each dirty page back to its own position (`page * 8192`). Writing 8 KiB is not atomic, so the first change to a page after a checkpoint puts a full copy of the page in the WAL, and recovery restores it before replaying later records (PostgreSQL: `src/backend/access/transam/README`, full-page images; InnoDB solves the same problem with a doublewrite buffer). Cost estimate: a hot set of ~12,500 pages (100k online players) adds ~100 MB of WAL per checkpoint, ~0.3 MB/s at one checkpoint every 5 minutes.
+
+Considered and rejected: DuckDB's copy-on-write checkpoint. Changed blocks go to free blocks, the blocks they replace are freed only after the checkpoint (`storage/single_file_block_manager.cpp:1367`), and the file has two headers written alternately (`:1449-1454`), so nothing a valid header points to is ever overwritten. It removes torn pages and full-page images and can make checkpoints sequential, but pages move, so every lookup needs a page mapping table (itself stored copy-on-write) plus free-block management, and an archetype's pages scatter in the file. It does not give transaction snapshots on its own: it only keeps the last checkpoint's version.
+
+What carries over from the in-memory code: `Entity`, the allocator, the component registry, `RowLayout` (the slot format of one component inside a page), `PageLayout` / `PageHeader`, and the Table logic as page operations. Split: `ecsql-core` (`no_std`) defines the page formats and table logic over `&mut [u8]` pages; `ecsql-storage` does files, the buffer pool and the WAL.
 
 **[DECIDED] Table page format (PAX).** Compared with PostgreSQL (24-byte header, line pointers for variable-size tuples, checksum mixed with the block number), SQLite (8-12 byte B-tree header, cell pointers, no page checksum), DuckDB (256 KiB blocks with an 8-byte checksum header, one block per column segment) and ScyllaDB (immutable compressed chunks). Fixed-size, dense rows let us drop line pointers, free-space pointers and per-page minipage offsets.
 
@@ -218,15 +242,15 @@ offset  size  field
 - Rows stay dense through swap-remove; an empty last page is freed. There are never dead rows inside a page, so there is no per-row free-space map and no PostgreSQL-style VACUUM (scanning every page and fixing every index).
 - **[OPEN] Cleanup still exists, at page level:** (1) once readers get snapshots (section 4), old versions must be dropped when no snapshot needs them: old page copies with copy-on-write pages, or in-memory deltas merged at checkpoint as in DuckDB; (2) freed pages leave holes in the file, so we need a free-page list for reuse and possibly a file-shrinking `VACUUM`, as SQLite has.
 
-**[OPEN] Next:** the sparse store's presence page format.
+**[DECIDED] Next:** the buffer pool, following PostgreSQL (`buf_init.c`, `bufmgr.c`, `freelist.c`).
 
 Starting design:
 
 - **Page-based files**, fixed page size (default 8 KiB), each with a header and checksum.
 - **Catalog file**: component definitions, archetype definitions (component sets and their table IDs).
-- **Table files [OPEN]**: how each archetype's pages are grouped into files.
+- **Table files [DECIDED]**: one file per archetype table, as PostgreSQL (one file per relation). Row `r` is on page `r / N` of its table's file, so finding a row is arithmetic with no page list; the buffer pool key is `(file_id, page_no)` like PG's `BufferTag`; shrinking after `swap_remove` is `ftruncate` and dropping a table is `unlink`, with no free-page list for table pages. Costs: an open-file cache under the OS fd limit (PG `fd.c`, LRU kept under `max_safe_fds`), and one fsync per dirty file at checkpoint. A query over a component (`Player(*)`) scans one file per matching archetype, each one sequentially; the catalog keeps a component -> archetypes map to find them (Bevy `ComponentIndex`, `archetype.rs:769`). Many small archetypes mean many small files: the defence is `SPARSE` for rare components (section 3.1, archetype explosion). One file for everything (SQLite, DuckDB) was rejected: it needs a per-table page list on every access, a free-page list and a VACUUM to shrink.
 - **Entity metadata file**: the `index -> { generation, archetype, row }` array, paged.
-- **Sparse stores**: presence pages plus data pages or B-tree pages, keyed by entity index.
+- **Sparse components**: one B-tree per component, keyed by entity index.
 - **Write-ahead log (WAL)**: append-only, records every mutation. This is the durability mechanism.
 - **Buffer pool [DECIDED]**: our own page cache with eviction, bypassing the OS page cache. Mmap gives up control over write ordering.
 
@@ -337,7 +361,7 @@ The planner is small by design:
 1. Resolve component names to `ComponentId`s.
 2. Build the `with` and `without` sets.
 3. Look up or create a cached query, with its incrementally maintained archetype match list.
-4. Choose the access path per matching archetype: a page scan of its table, a sparse presence check, or a secondary index lookup.
+4. Choose the access path per matching archetype: a page scan of its table, a sparse B-tree lookup, or a secondary index lookup.
 5. Push filters down into the column scan. Prefer filtering on the most selective column first.
 
 **Secondary indexes [PLANNED]:** **[DECIDED]** explicit and opt-in, declared by the user (`CREATE INDEX ON Name`, optionally UNIQUE), as in PostgreSQL. Every index costs work on each insert or change of its component, so the database never adds one on its own. A B-tree by default, as in PostgreSQL (`nbtree`, Lehman & Yao), because it also serves ranges, prefixes, `ORDER BY` and UNIQUE, not just equality. Unlike PostgreSQL, whose index entries hold a physical TID (`ItemPointerData { block, offset }`), our leaves hold the `Entity`, so `swap_remove` and archetype moves never touch an index; only a change to the indexed value does. A login is then `index -> Entity -> metadata -> (archetype, row) -> one page`. **[OPEN]** spatial indexes on `Position`.
@@ -400,8 +424,8 @@ Crate name: **ecsql**. Check crates.io and GitHub availability first. Fallbacks:
 
 > **[DECIDED]** Because the workload is storage first (section 1), the page format and buffer pool come right after the core data structures, instead of waiting for the whole in-memory store and the benchmark gate. The list below is the original plan; progress so far:
 > - Done in `ecsql-core`: `Entity` and the entity allocator, the component registry, `RowLayout`, `Column` (aligned type-erased rows, checked with Miri), `Table` (push, reserve, swap_remove, move_row_to).
-> - **[DECIDED]** Storage is archetype tables in PAX pages, with opt-in sparse stores (section 3.1). The `Table` code maps to one page's operations.
-> - Next: the presence and data page formats, then the buffer pool and WAL, then the World on top of them.
+> - **[DECIDED]** Storage is archetype tables in PAX pages, with opt-in sparse B-trees (section 3.1). Stored data lives only in buffer-pool pages (section 3.3).
+> - **[DECIDED 2026-11-20] Build order:** buffer pool, then table page operations (replacing the heap `Column`/`Table`), then the B-tree (sparse components and indexes), then WAL, checkpoint and recovery, then the World.
 
 1. **M1: In-memory archetype store** (`ecsql-core`)
    - Runtime-defined components, spawn/despawn, insert/remove, edges cache.
@@ -417,7 +441,7 @@ Crate name: **ecsql**. Check crates.io and GitHub availability first. Fallbacks:
    - Pages, WAL, checkpoint, recovery. Single writer.
    - Fault-injection crash tests.
 5. **M5: Archetype-move optimizations**
-   - Per-transaction coalescing and batching, sparse stores for toggled components, move plans per archetype edge.
+   - Per-transaction coalescing and batching, sparse B-trees for toggled components, move plans per archetype edge.
 6. **M6: Transactions and concurrency**
    - Snapshot isolation, concurrent readers, then (maybe) multiple writers.
 7. **M7: Server**
@@ -435,7 +459,7 @@ Crate name: **ecsql**. Check crates.io and GitHub availability first. Fallbacks:
 - **Invariants to assert in debug builds:**
   - `entities[i].archetype/row` always points at a table row whose entity column holds that entity.
   - Every column in a table has the same length as the table's entity column.
-  - A sparse component's presence bit is set exactly for the entities that have it.
+  - A sparse component's B-tree holds exactly the entities that have it.
   - Archetype component sets are sorted and unique.
 - **Benchmarks** (criterion): scan one column, scan many columns, query across many archetypes, bulk add/remove component, spawn throughput, recovery time versus WAL size.
 
@@ -481,3 +505,8 @@ Crate name: **ecsql**. Check crates.io and GitHub availability first. Fallbacks:
 | 2026-11-18 | Updates replace a whole component value, not single fields: the logic lives in the component. |
 | 2026-11-18 | Regular pages with update in place (like PostgreSQL, SQLite, InnoDB, DuckDB), not an LSM. PAX table page: 24-byte header (lsn, CRC32C checksum, archetype_id, row_count, kind, version), minipages ordered by alignment, 2 KiB maximum row size. |
 | 2026-11-18 | Relations: owned things are separate entities, and the link lives on the owned entity (`ItemOwner(owner entity)`), queried through an index. Indexes are explicit and declared by the user. |
+| 2026-11-20 | Engine follows PostgreSQL: stored data lives only in 8 KiB pages, held in memory as buffer-pool frames and written back as is after the WAL. No separate in-memory layout; the heap-buffer `Column`/`Table` get replaced by operations on PAX pages. Compared with ScyllaDB's allocator + memtable + SSTables on five example queries (section 3.3). |
+| 2026-11-20 | `SPARSE` components are a B-tree keyed by entity index (SQLite rowid-table style), replacing presence bitmaps plus entity-indexed arrays: space matches the entities that have the component, nothing moves, every page is a disk page. |
+| 2026-11-20 | Build order: buffer pool next, then table page operations, the B-tree, WAL/checkpoint/recovery, then the World. |
+| 2026-11-20 | Torn pages: overwrite in place with full-page images in the WAL, as PostgreSQL; page `p` lives at file offset `p * 8192`. DuckDB's copy-on-write checkpoint with alternating headers considered and rejected (needs a page mapping table, scatters table pages). |
+| 2026-11-21 | One file per archetype table (PostgreSQL), not one file for everything (SQLite/DuckDB): row -> page stays arithmetic, files shrink with `ftruncate`; costs an open-file cache and one fsync per dirty file at checkpoint. |
