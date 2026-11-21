@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ecsql-core"]
+members = ["ecsql-core", "ecsql-os", "ecsql-storage"]
 
 [workspace.package]
 edition = "2024"

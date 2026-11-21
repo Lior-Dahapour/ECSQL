@@ -29,6 +29,9 @@ ECSQL is the database a game server saves to and loads from, not the live game w
 - Per-tick update rates (for example 120 Hz) are not the target workload.
 - What matters most: crash safety, fast point lookups, compact pages, and scans that read only the columns they need.
 
+### Platforms **[DECIDED]**
+All OS-specific code lives in the `ecsql-os` crate (files now; networking and other OS calls later), as PostgreSQL's `src/port` (`libpgport`) and SQLite's `os_unix.c` / `os_win.c`. No other crate calls OS-specific APIs. `ecsql_os::Vfd` (virtual file descriptor, PG `fd.c` `Vfd`) owns every file operation we use (create, open, size, positional read/write, sync), and later the open-file cache (the real fd closed and reopened behind the caller's back), so direct I/O, `fallocate` or io_uring later change only `ecsql-os`. Unix (Linux, macOS) is implemented now and other targets fail with a `compile_error!`; Windows is added later as a `#[cfg(windows)]` variant (`ReadFile`/`WriteFile` with an offset, which moves the file cursor, so no code may rely on the cursor). Linux is the performance target.
+
 ### Non-goals (at least initially)
 - Full SQL compatibility. ECSQL is SQL-flavoured, not SQL.
 - Distributed operation or replication.
@@ -408,6 +411,7 @@ for row in client.query("SELECT Position, Health").await? {
 ```
 ecsql/
  ├─ ecsql-core/      # no_std + alloc: entities, components, archetypes, tables, in-memory queries
+ ├─ ecsql-os/        # all OS-specific code: files (positional I/O, sync), later networking
  ├─ ecsql-storage/   # pages, buffer pool, WAL, checkpoints, compaction, recovery
  ├─ ecsql-lang/      # lexer, parser, AST, planner, query IR
  ├─ ecsql-server/    # server process: wire protocol, sessions, transactions per connection
@@ -510,3 +514,4 @@ Crate name: **ecsql**. Check crates.io and GitHub availability first. Fallbacks:
 | 2026-11-20 | Build order: buffer pool next, then table page operations, the B-tree, WAL/checkpoint/recovery, then the World. |
 | 2026-11-20 | Torn pages: overwrite in place with full-page images in the WAL, as PostgreSQL; page `p` lives at file offset `p * 8192`. DuckDB's copy-on-write checkpoint with alternating headers considered and rejected (needs a page mapping table, scatters table pages). |
 | 2026-11-21 | One file per archetype table (PostgreSQL), not one file for everything (SQLite/DuckDB): row -> page stays arithmetic, files shrink with `ftruncate`; costs an open-file cache and one fsync per dirty file at checkpoint. |
+| 2026-11-21 | All OS-specific code in an `ecsql-os` crate (PG `libpgport` style) with its own `Vfd` type (PG `fd.c`); Unix now, Windows later as a cfg variant; no other crate has OS code. |

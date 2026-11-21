@@ -1,0 +1,12 @@
+[package]
+name = "ecsql-storage"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ecsql-core = { path = "../ecsql-core" }
+ecsql-os = { path = "../ecsql-os" }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

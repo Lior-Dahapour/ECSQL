@@ -1,5 +1,3 @@
-//! Runtime component definitions: the catalog of component schemas.
-
 mod align;
 mod field;
 mod types;
@@ -17,12 +15,10 @@ pub use align::align_up;
 pub use field::Field;
 pub use types::FieldType;
 
-/// Dense handle for a registered component: `0, 1, 2, ...` in registration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(u32);
 
 impl ComponentId {
-    /// Position of this component in the registry.
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -49,47 +45,34 @@ pub struct ComponentInfo {
 }
 
 impl ComponentInfo {
-    /// This component's ID.
     pub fn id(&self) -> ComponentId {
         self.id
     }
 
-    /// This component's name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Fields in declaration order.
     pub fn fields(&self) -> &[Field] {
         &self.fields
     }
 
-    /// Storage kind chosen at registration.
     pub fn storage(&self) -> StorageKind {
         self.storage
     }
 
-    /// Bytes per value, including padding: the stride of this component's column. 0 for a tag.
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// Required alignment of each value and of the column's allocation.
     pub fn align(&self) -> usize {
         self.align
     }
 
-    /// Returns `true` if the component has no fields.
     pub fn is_tag(&self) -> bool {
         self.fields.is_empty()
     }
 
-    /// Looks up a field by name.
-    ///
-    /// # Returns
-    ///
-    /// The field's position in [`ComponentInfo::fields`] and the field itself, or `None` if no
-    /// field has that name.
     pub fn field(&self, name: &str) -> Option<(usize, &Field)> {
         for (i, field) in self.fields.iter().enumerate() {
             if field.name() == name {
@@ -100,52 +83,24 @@ impl ComponentInfo {
     }
 }
 
-/// Errors from registering components.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ComponentError {
-    /// A component with this name is already registered.
     #[error("component `{0}` already exists")]
     DuplicateComponent(String),
-    /// The same field name appears twice in one definition.
     #[error("component `{component}` declares field `{field}` more than once")]
     DuplicateField { component: String, field: String },
 }
 
-/// Registry of all component schemas, indexed by [`ComponentId`] and by name.
 #[derive(Debug, Default)]
 pub struct Components {
-    /// `infos[id.index()]` is the component with that ID.
     infos: Vec<ComponentInfo>,
     by_name: HashMap<Box<str>, ComponentId>,
 }
 
 impl Components {
-    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Registers a new component schema.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Component name, unique in the registry
-    /// * `fields` - `(field name, type)` pairs in declaration order; empty for a tag
-    /// * `storage` - Where the component's values will live
-    ///
-    /// # Returns
-    ///
-    /// The new component's ID, the next unused index.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ComponentError::DuplicateComponent`] if `name` is taken, or
-    /// [`ComponentError::DuplicateField`] if a field name repeats. On error the registry is
-    /// left unchanged.
-    ///
-    /// # Panics
-    ///
-    /// Panics if more than `u32::MAX` components would exist.
     pub fn register(
         &mut self,
         name: &str,

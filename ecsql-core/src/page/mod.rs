@@ -1,71 +1,3 @@
-//! On-disk page formats.
-//!
-//! Every file ECSQL writes is a sequence of fixed-size pages of [`PAGE_SIZE`] bytes. A page is
-//! the unit of I/O, of caching in the buffer pool, and of checksumming. All integers in a page
-//! are little-endian.
-//!
-//! # Table pages
-//!
-//! A table page holds up to N whole entities of one archetype, in the PAX layout ("partition
-//! attributes across"): entities are grouped per page like a row store, but inside the page each
-//! component is stored contiguously in its own *minipage*, like a column store.
-//!
-//! ```text
-//! +----------------------------------------------------------------------------+
-//! | header (24 bytes)                                                          |
-//! +----------------------------------------------------------------------------+
-//! | entity IDs        e0 e1 e2 ... e(N-1)                        N x 8 bytes   |
-//! +----------------------------------------------------------------------------+
-//! | component A       a0 a1 a2 ... a(N-1)                        N x size(A)   |
-//! +----------------------------------------------------------------------------+
-//! | component B       b0 b1 b2 ... b(N-1)                        N x size(B)   |
-//! +----------------------------------------------------------------------------+
-//! | ...                                                                        |
-//! +--------------------------------------------------------+-------------------+
-//! |                                                        | unused tail       |
-//! +--------------------------------------------------------+-------------------+
-//! ```
-//!
-//! Slot `s` of every minipage belongs to the same entity, whose ID is slot `s` of the entity
-//! minipage. Slots `0..row_count` are in use and always dense: a removed row is filled with the
-//! table's last row (swap-remove), so a page has no holes and needs no free-space bookkeeping.
-//!
-//! Header:
-//!
-//! ```text
-//! offset  size  field
-//!  0      8     lsn           WAL position of the last change; the page is never written
-//!                             to disk before the WAL is durable up to this point
-//!  8      4     checksum      CRC32C of the page with this field zeroed, mixed with the page
-//!                             number so a page written to the wrong place fails the check
-//! 12      4     archetype_id  whose layout this page uses
-//! 16      2     row_count     slots in use
-//! 18      1     kind          table page, sparse page, metadata page, ...
-//! 19      1     version       format version
-//! 20      4     reserved
-//! ```
-//!
-//! The layout of a table page depends only on its archetype, so it is computed once per
-//! archetype ([`PageLayout`]) and never stored in the page:
-//!
-//! - `N = (PAGE_SIZE - HEADER_SIZE) / (ENTITY_SIZE + sum of component sizes)`.
-//! - Component minipages are ordered by alignment, largest first (stable). Each minipage is
-//!   `N * size` bytes, a multiple of its alignment, so every minipage starts aligned with no
-//!   padding. This is the same rule `RowLayout` applies to the fields inside one component.
-//! - Tags (size 0) take no space.
-//! - Row `r` of a table is page `r / N`, slot `r % N`; its component `C` starts at
-//!   `offset(C) + slot * size(C)`.
-//! - The sum of an entity's component sizes may not exceed [`MAX_ROW_SIZE`], which leaves room
-//!   for at least 3 rows per page. Larger data belongs in separate entities or sparse storage.
-//!
-//! # Why this format
-//!
-//! PostgreSQL's heap pages and SQLite's B-tree pages are *slotted*: tuples have variable size, so
-//! the page keeps an array of line (cell) pointers plus free-space bounds. Our rows are
-//! fixed-size and dense, so a slot's position is arithmetic and none of that is needed. Loading
-//! an entity reads one page, as in a row store, while a query over one component reads
-//! contiguous bytes, as in a column store.
-
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -76,32 +8,39 @@ use thiserror::Error;
 
 pub const PAGE_SIZE: usize = 8192;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PageId(u32);
+impl PageId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+    pub fn file_offset(self) -> u64 {
+        u64::from(self.0) * (PAGE_SIZE as u64)
+    }
+    #[inline]
+    pub fn get(&self) -> u32 {
+        self.0
+    }
+}
 pub const HEADER_SIZE: usize = 24;
 
 pub const ENTITY_SIZE: usize = size_of::<u64>();
 
-/// Largest allowed sum of component sizes for one entity.
 pub const MAX_ROW_SIZE: usize = 2048;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PageLayoutError {
-    /// The components of one entity add up to more than [`MAX_ROW_SIZE`] bytes.
     #[error("row of {size} bytes exceeds the {max}-byte limit")]
     RowTooLarge { size: usize, max: usize },
 }
 
-/// Where each minipage of an archetype's table page starts, and how many rows a page holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageLayout {
     rows_per_page: usize,
-    /// In the caller's component order, not physical order.
     component_offsets: Box<[usize]>,
 }
 
 impl PageLayout {
-    /// Computes the layout for an archetype whose components have these row layouts.
-    ///
-    /// Fails if the sizes add up to more than [`MAX_ROW_SIZE`].
     pub fn compute(components: &[Layout]) -> Result<Self, PageLayoutError> {
         let mut component_offsets = vec![0usize; components.len()];
         let row_size: usize = components.iter().map(Layout::size).sum();
@@ -126,26 +65,21 @@ impl PageLayout {
         })
     }
 
-    /// N: how many rows one page holds.
     pub fn rows_per_page(&self) -> usize {
         self.rows_per_page
     }
 
-    /// Byte offset of the entity ID minipage.
     pub fn entity_offset(&self) -> usize {
         HEADER_SIZE
     }
 
-    /// Byte offset of the minipage of `components[index]`, as passed to [`PageLayout::compute`].
     pub fn component_offset(&self, index: usize) -> usize {
         self.component_offsets[index]
     }
 }
 
-/// Header format version written by this code.
 pub const FORMAT_VERSION: u8 = 1;
 
-/// What a page holds; stored as one byte. Zero is not a kind, so a never-written page fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageKind {
     Table = 1,
@@ -161,7 +95,6 @@ pub enum PageHeaderError {
     UnsupportedVersion(u8),
 }
 
-/// The 24-byte header at the start of every page (layout in the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageHeader {
     pub lsn: u64,
@@ -173,7 +106,6 @@ pub struct PageHeader {
 }
 
 impl PageHeader {
-    /// Decodes the header from the first [`HEADER_SIZE`] bytes of `page`.
     pub fn read(page: &[u8; PAGE_SIZE]) -> Result<Self, PageHeaderError> {
         let lsn = u64::from_le_bytes(page[0..8].try_into().expect("slice is 8 bytes"));
         let checksum = u32::from_le_bytes(page[8..12].try_into().expect("slice is 4 bytes"));
@@ -199,8 +131,6 @@ impl PageHeader {
         })
     }
 
-    /// Encodes the header into the first [`HEADER_SIZE`] bytes of `page`, zeroing the reserved
-    /// bytes. The rest of the page is untouched.
     pub fn write(&self, page: &mut [u8; PAGE_SIZE]) {
         page[0..8].copy_from_slice(&self.lsn.to_le_bytes());
         page[8..12].copy_from_slice(&self.checksum.to_le_bytes());
@@ -217,6 +147,18 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
+
+    /* AI GENERATED TEST */
+    #[test]
+    fn page_file_offset_is_computed_in_u64() {
+        assert_eq!(PageId::new(0).file_offset(), 0);
+        assert_eq!(PageId::new(1).file_offset(), 8192);
+        assert_eq!(PageId::new(600_000).file_offset(), 600_000 * 8192);
+        assert_eq!(
+            PageId::new(u32::MAX).file_offset(),
+            u64::from(u32::MAX) * 8192
+        );
+    }
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).expect("valid layout")
